@@ -23,6 +23,16 @@ pub fn overlaid<T>(content: T) -> Overlay<T> {
     }
 }
 
+/// Like `overlaid` but with custom horizontal and vertical percentages.
+pub fn overlaid_with_size<T>(content: T, percent_h: u8, percent_v: u8) -> Overlay<T> {
+    Overlay {
+        content,
+        calc_child_size: Box::new(move |rect: Rect| {
+            clip_rect_relative(rect.clip_bottom(2), percent_h, percent_v)
+        }),
+    }
+}
+
 fn clip_rect_relative(rect: Rect, percent_horizontal: u8, percent_vertical: u8) -> Rect {
     fn mul_and_cast(size: u16, factor: u8) -> u16 {
         ((size as u32) * (factor as u32) / 100).try_into().unwrap()

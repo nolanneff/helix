@@ -91,7 +91,67 @@ impl EditorView {
 
         let view_offset = doc.view_offset(view.id);
 
-        let text_annotations = view.text_annotations(doc, Some(theme));
+        // Compute AI progress info for all active requests targeting this document.
+        // Each entry: (above_line, below_line, above_char, below_char, thinking_lines, has_tool_line, req_index)
+        let ai_progress_infos: Vec<(usize, usize, usize, usize, u8, bool, usize)> = editor
+            .ai_requests
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, req)| {
+                if req.doc_id != doc.id() || (req.original_from == 0 && req.original_to == 0) {
+                    return None;
+                }
+                let text = doc.text().slice(..);
+                let start_line = text.char_to_line(req.original_from.min(text.len_chars()));
+                let end_line = text.char_to_line(
+                    req.original_to
+                        .saturating_sub(1)
+                        .min(text.len_chars().saturating_sub(1)),
+                );
+                let above_line = start_line.saturating_sub(1);
+                let below_line = end_line;
+                let above_char = text.line_to_char(above_line);
+                let below_char = text.line_to_char(below_line);
+
+                let thinking_lines: u8 = {
+                    let stream = req
+                        .streaming_text
+                        .lock()
+                        .map(|g| g.clone())
+                        .unwrap_or_default();
+                    if stream.is_empty() {
+                        0
+                    } else {
+                        let max_width = (inner.width as usize).saturating_sub(4).max(10);
+                        let mut line_count = 0usize;
+                        for para in stream.lines() {
+                            if para.trim().is_empty() {
+                                continue;
+                            }
+                            line_count += (para.len() / max_width) + 1;
+                        }
+                        if line_count == 0 {
+                            line_count = (stream.len() / max_width) + 1;
+                        }
+                        (line_count.min(2)) as u8
+                    }
+                };
+
+                let has_tool_line = req
+                    .tool_display
+                    .lock()
+                    .map(|g| !g.is_empty())
+                    .unwrap_or(false);
+
+                Some((above_line, below_line, above_char, below_char, thinking_lines, has_tool_line, idx))
+            })
+            .collect();
+
+        let annotation_tuples: Vec<(usize, usize, usize, usize, u8, bool)> = ai_progress_infos
+            .iter()
+            .map(|&(a, b, c, d, e, f, _)| (a, b, c, d, e, f))
+            .collect();
+        let text_annotations = view.text_annotations_with_ai(doc, Some(theme), &annotation_tuples);
         let mut decorations = DecorationManager::default();
 
         if is_focused && config.cursorline {
@@ -196,6 +256,34 @@ impl EditorView {
             inline_diagnostic_config,
             config.end_of_line_diagnostics,
         ));
+        for &(above_line, below_line, _, _, thinking_lines, has_tool_line, req_idx) in &ai_progress_infos {
+            let req = &editor.ai_requests[req_idx];
+            use helix_view::graphics::Modifier;
+            let base = theme.get("comment");
+            let thinking_style = helix_view::graphics::Style::default()
+                .fg(base.fg.unwrap_or(helix_view::graphics::Color::Gray))
+                .add_modifier(Modifier::ITALIC | Modifier::DIM);
+            let spinner_style = helix_view::graphics::Style::default()
+                .fg(base.fg.unwrap_or(helix_view::graphics::Color::Gray))
+                .add_modifier(Modifier::DIM);
+            let tool_style = helix_view::graphics::Style::default()
+                .fg(helix_view::graphics::Color::Cyan)
+                .add_modifier(Modifier::DIM);
+            decorations.add_decoration(
+                text_decorations::ai_progress::AiProgressDecoration {
+                    streaming_text: std::sync::Arc::clone(&req.streaming_text),
+                    tool_display: std::sync::Arc::clone(&req.tool_display),
+                    started_at: req.started_at,
+                    above_line,
+                    below_line,
+                    thinking_lines,
+                    has_tool_line,
+                    style: thinking_style,
+                    spinner_style,
+                    tool_style,
+                },
+            );
+        }
         render_document(
             surface,
             inner,

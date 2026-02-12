@@ -440,10 +440,20 @@ impl View {
     }
 
     /// Get the text annotations to display in the current view for the given document and theme.
+    /// `ai_progress` is (start_line, end_line, start_char, end_char) for an active AI request.
     pub fn text_annotations<'a>(
         &self,
         doc: &'a Document,
         theme: Option<&Theme>,
+    ) -> TextAnnotations<'a> {
+        self.text_annotations_with_ai(doc, theme, &[])
+    }
+
+    pub fn text_annotations_with_ai<'a>(
+        &self,
+        doc: &'a Document,
+        theme: Option<&Theme>,
+        ai_progress_list: &[(usize, usize, usize, usize, u8, bool)],
     ) -> TextAnnotations<'a> {
         let mut text_annotations = TextAnnotations::default();
 
@@ -511,6 +521,14 @@ impl View {
                 doc.view_offset(self.id).horizontal_offset,
                 config,
             ));
+        }
+
+        for &(start_line, end_line, start_char, end_char, thinking_lines, has_tool_line) in ai_progress_list {
+            text_annotations.add_line_annotation(
+                crate::annotations::ai_progress::AiProgressAnnotation::new(
+                    start_line, end_line, start_char, end_char, thinking_lines, has_tool_line,
+                ),
+            );
         }
 
         text_annotations

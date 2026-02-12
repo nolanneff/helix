@@ -2746,6 +2746,186 @@ fn noop(_cx: &mut compositor::Context, _args: Args, _event: PromptEvent) -> anyh
     Ok(())
 }
 
+fn ai_replace(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let config = cx.editor.config();
+    if !config.ai.enable {
+        anyhow::bail!("AI features are disabled. Set [editor.ai] enable = true");
+    }
+
+    let (view, doc) = current!(cx.editor);
+    let text = doc.text().clone();
+    let selection = doc.selection(view.id).clone();
+    let primary = selection.primary();
+    let from = primary.from();
+    let to = primary.to();
+    let selected_text: String = primary.fragment(text.slice(..)).into_owned();
+
+    if selected_text.is_empty() {
+        anyhow::bail!("No selection for AI replace");
+    }
+
+    let file_contents = text.to_string();
+    let file_path = doc.path().cloned();
+    let doc_id = doc.id();
+    let doc_version = doc.version();
+    let view_id = view.id;
+    let ai_config = config.ai.clone();
+
+    let prompt = crate::ui::ai_prompt::AiPrompt::new(
+        "AI Replace".to_string(),
+        move |ctx: &mut compositor::Context, user_instructions: String| {
+            super::ai::start_ai_replace_request_from_compositor(
+                ctx,
+                ai_config,
+                doc_id,
+                view_id,
+                from,
+                to,
+                selected_text,
+                file_contents,
+                file_path,
+                doc_version,
+                user_instructions,
+            );
+        },
+    );
+
+    cx.editor.set_status("Opening AI prompt...");
+    let callback = async move {
+        let call: crate::job::Callback =
+            crate::job::Callback::EditorCompositor(Box::new(move |_editor, compositor| {
+                compositor.push(Box::new(crate::ui::overlay::overlaid(prompt)));
+            }));
+        Ok(call)
+    };
+    cx.jobs.callback(callback);
+
+    Ok(())
+}
+
+fn ai_cancel_cmd(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    if cx.editor.ai_requests.is_empty() {
+        cx.editor.set_status("No active AI requests");
+        return Ok(());
+    }
+
+    // Parse optional index argument (1-based, 1=most recent)
+    let index: usize = if let Some(arg) = args.first() {
+        let arg_str: &str = arg.as_ref();
+        arg_str.parse::<usize>().map_err(|_| anyhow::anyhow!("Expected a number"))?
+    } else {
+        1 // default: most recent
+    };
+
+    let len = cx.editor.ai_requests.len();
+    if index == 0 || index > len {
+        anyhow::bail!("Invalid request index {}. {} active request(s).", index, len);
+    }
+
+    // index=1 means most recent = last element = position len-1
+    let pos = len - index;
+    let req = cx.editor.ai_requests.remove(pos);
+    req.stop_ticker.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let remaining = cx.editor.ai_requests.len();
+    if remaining > 0 {
+        cx.editor.set_status(format!("AI request #{} cancelled ({} remaining)", index, remaining));
+    } else {
+        cx.editor.set_status("AI request cancelled");
+    }
+    Ok(())
+}
+
+fn ai_cancel_all_cmd(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let count = cx.editor.ai_requests.len();
+    for req in cx.editor.ai_requests.drain(..) {
+        req.stop_ticker.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if count > 0 {
+        cx.editor.set_status(format!("{} AI request(s) cancelled", count));
+    } else {
+        cx.editor.set_status("No active AI requests");
+    }
+    Ok(())
+}
+
+fn ai_search_cmd(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let config = cx.editor.config();
+    if !config.ai.enable {
+        anyhow::bail!("AI features are disabled. Set [editor.ai] enable = true");
+    }
+
+    let (_view, doc) = current!(cx.editor);
+    let file_path = doc.path().cloned();
+    let ai_config = config.ai.clone();
+
+    let prompt = crate::ui::ai_prompt::AiPrompt::new(
+        "AI Search".to_string(),
+        move |ctx: &mut compositor::Context, user_instructions: String| {
+            super::ai::start_ai_search_request_from_compositor(
+                ctx,
+                ai_config,
+                file_path,
+                user_instructions,
+            );
+        },
+    );
+
+    let callback = async move {
+        let call: crate::job::Callback =
+            crate::job::Callback::EditorCompositor(Box::new(move |_editor, compositor| {
+                compositor.push(Box::new(crate::ui::overlay::overlaid(prompt)));
+            }));
+        Ok(call)
+    };
+    cx.jobs.callback(callback);
+
+    Ok(())
+}
+
+fn ai_results_cmd(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    super::ai::ai_show_results(cx);
+    Ok(())
+}
+
 /// This command accepts a single boolean --skip-visible flag and no positionals.
 const BUFFER_CLOSE_OTHERS_SIGNATURE: Signature = Signature {
     positionals: (0, Some(0)),
@@ -3818,6 +3998,46 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
             positionals: (0, None),
             ..Signature::DEFAULT
         },
+    },
+    TypableCommand {
+        name: "ai-replace",
+        aliases: &["ai"],
+        doc: "Open AI replace prompt for the current selection.",
+        fun: ai_replace,
+        completer: CommandCompleter::none(),
+        signature: Signature::DEFAULT,
+    },
+    TypableCommand {
+        name: "ai-cancel",
+        aliases: &[],
+        doc: "Cancel the active AI request.",
+        fun: ai_cancel_cmd,
+        completer: CommandCompleter::none(),
+        signature: Signature::DEFAULT,
+    },
+    TypableCommand {
+        name: "ai-cancel-all",
+        aliases: &[],
+        doc: "Cancel all active AI requests.",
+        fun: ai_cancel_all_cmd,
+        completer: CommandCompleter::none(),
+        signature: Signature::DEFAULT,
+    },
+    TypableCommand {
+        name: "ai-search",
+        aliases: &[],
+        doc: "Open AI semantic search prompt.",
+        fun: ai_search_cmd,
+        completer: CommandCompleter::none(),
+        signature: Signature::DEFAULT,
+    },
+    TypableCommand {
+        name: "ai-results",
+        aliases: &[],
+        doc: "Browse AI search results in a file picker.",
+        fun: ai_results_cmd,
+        completer: CommandCompleter::none(),
+        signature: Signature::DEFAULT,
     },
 ];
 

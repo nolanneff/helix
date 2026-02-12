@@ -1,6 +1,7 @@
 #[macro_use]
 pub mod macros;
 
+pub mod ai;
 pub mod annotations;
 pub mod clipboard;
 pub mod document;

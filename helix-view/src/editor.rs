@@ -428,6 +428,8 @@ pub struct Config {
     /// Whether to enable Kitty Keyboard Protocol
     pub kitty_keyboard_protocol: KittyKeyboardProtocolConfig,
     pub buffer_picker: BufferPickerConfig,
+    /// AI-assisted code replacement configuration
+    pub ai: AiConfig,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Clone, Copy)]
@@ -454,6 +456,70 @@ impl PickerStartPosition {
     pub fn is_current(self) -> bool {
         matches!(self, Self::Current)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AiProvider {
+    Claude,
+    OpenCode,
+    Custom,
+}
+
+impl Default for AiProvider {
+    fn default() -> Self {
+        AiProvider::Claude
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct AiConfig {
+    /// Whether AI features are enabled
+    pub enable: bool,
+    /// Which AI provider to use
+    pub provider: AiProvider,
+    /// Model name to pass to the provider CLI
+    pub model: String,
+    /// Custom command template (for Custom provider). Use {model} and {prompt} placeholders.
+    pub custom_command: Vec<String>,
+    /// Context file names to auto-discover walking up from file dir to workspace root
+    pub context_files: Vec<String>,
+    /// Return to normal mode after submitting an AI prompt
+    pub return_to_normal: bool,
+    /// Maximum number of concurrent AI requests (0 = unlimited)
+    pub max_concurrent: usize,
+    /// Model to use for AI search (defaults to "haiku" for speed)
+    pub search_model: String,
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            provider: AiProvider::default(),
+            model: String::from("sonnet"),
+            custom_command: Vec::new(),
+            context_files: vec![
+                "AGENT.md".to_string(),
+            ],
+            return_to_normal: true,
+            max_concurrent: 5,
+            search_model: String::new(),
+        }
+    }
+}
+
+/// A single result from an AI search, persisted for the :ai-results picker.
+#[derive(Debug, Clone)]
+pub struct AiSearchResult {
+    pub path: PathBuf,
+    /// 0-indexed line number
+    pub line_num: usize,
+    /// How many lines to highlight (the X value from the AI output format)
+    pub highlight_lines: usize,
+    /// AI's explanation for why this result matched
+    pub notes: String,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Clone, Copy)]
@@ -609,6 +675,7 @@ impl Default for StatusLineConfig {
                 E::FileName,
                 E::ReadOnlyIndicator,
                 E::FileModificationIndicator,
+                E::AiSpinner,
             ],
             center: vec![],
             right: vec![
@@ -715,6 +782,9 @@ pub enum StatusLineElement {
 
     /// The base of current working directory
     CurrentWorkingDirectory,
+
+    /// AI operation spinner
+    AiSpinner,
 }
 
 // Cursor shape is read and used on every rendered frame and so needs
@@ -1146,6 +1216,7 @@ impl Default for Config {
             rainbow_brackets: false,
             kitty_keyboard_protocol: Default::default(),
             buffer_picker: BufferPickerConfig::default(),
+            ai: AiConfig::default(),
         }
     }
 }
@@ -1246,6 +1317,12 @@ pub struct Editor {
     pub handlers: Handlers,
 
     pub mouse_down_range: Option<Range>,
+    /// Active AI requests (supports concurrent requests)
+    pub ai_requests: Vec<crate::ai::AiRequestState>,
+    /// Counter for assigning unique AI request IDs
+    pub ai_next_request_id: crate::ai::RequestId,
+    /// Stored results from the last AI search (for :ai-results picker)
+    pub ai_search_results: Vec<AiSearchResult>,
     pub cursor_cache: CursorCache,
 }
 
@@ -1367,6 +1444,9 @@ impl Editor {
             needs_redraw: false,
             handlers,
             mouse_down_range: None,
+            ai_requests: Vec::new(),
+            ai_next_request_id: 1,
+            ai_search_results: Vec::new(),
             cursor_cache: CursorCache::default(),
         }
     }
@@ -1401,6 +1481,22 @@ impl Editor {
 
     pub fn config(&self) -> DynGuard<Config> {
         self.config.load()
+    }
+
+    /// Allocate a new unique AI request ID.
+    pub fn next_ai_request_id(&mut self) -> crate::ai::RequestId {
+        let id = self.ai_next_request_id;
+        self.ai_next_request_id += 1;
+        id
+    }
+
+    /// Remove a specific AI request by ID, returning it if found.
+    pub fn take_ai_request(&mut self, id: crate::ai::RequestId) -> Option<crate::ai::AiRequestState> {
+        if let Some(pos) = self.ai_requests.iter().position(|r| r.id == id) {
+            Some(self.ai_requests.remove(pos))
+        } else {
+            None
+        }
     }
 
     /// Call if the config has changed to let the editor update all

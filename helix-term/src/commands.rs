@@ -1,3 +1,4 @@
+pub(crate) mod ai;
 pub(crate) mod dap;
 pub(crate) mod lsp;
 pub(crate) mod syntax;
@@ -603,6 +604,10 @@ impl MappableCommand {
         shell_insert_output, "Insert shell command output before selections",
         shell_append_output, "Append shell command output after selections",
         shell_keep_pipe, "Filter selections with shell predicate",
+        ai_replace_selection, "Replace selection using AI",
+        ai_search, "Search codebase using AI",
+        ai_cancel, "Cancel active AI request",
+        ai_show_results, "Browse AI search results",
         suspend, "Suspend and return to shell",
         rename_symbol, "Rename symbol",
         increment, "Increment item under cursor",
@@ -6319,6 +6324,27 @@ fn shell_keep_pipe(cx: &mut Context) {
         let index = index.unwrap_or_else(|| ranges.len() - 1);
         doc.set_selection(view.id, Selection::new(ranges, index));
     });
+}
+
+fn ai_replace_selection(cx: &mut Context) {
+    ai::ai_replace_selection(cx);
+}
+
+fn ai_search(cx: &mut Context) {
+    ai::ai_search(cx);
+}
+
+fn ai_cancel(cx: &mut Context) {
+    ai::ai_cancel(cx);
+}
+
+fn ai_show_results(cx: &mut Context) {
+    let mut comp_cx = compositor::Context {
+        editor: cx.editor,
+        jobs: cx.jobs,
+        scroll: None,
+    };
+    ai::ai_show_results(&mut comp_cx);
 }
 
 fn shell_impl(shell: &[String], cmd: &str, input: Option<Rope>) -> anyhow::Result<Tendril> {

@@ -157,6 +157,7 @@ where
         helix_view::editor::StatusLineElement::VersionControl => render_version_control,
         helix_view::editor::StatusLineElement::Register => render_register,
         helix_view::editor::StatusLineElement::CurrentWorkingDirectory => render_cwd,
+        helix_view::editor::StatusLineElement::AiSpinner => render_ai_spinner,
     }
 }
 
@@ -209,6 +210,98 @@ where
             .unwrap_or(" ")
             .into(),
     );
+}
+
+fn render_ai_spinner<'a, F>(context: &mut RenderContext<'a>, write: F)
+where
+    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+{
+    let count = context.editor.ai_requests.len();
+    if count == 0 {
+        return;
+    }
+
+    const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let frame_idx = (millis / 120) as usize % FRAMES.len();
+    let style = context.editor.theme.get("ui.statusline");
+
+    // Show the most recent request's thinking text and tool call independently.
+    let (thinking_snippet, tool_snippet) = context
+        .editor
+        .ai_requests
+        .last()
+        .map(|req| {
+            let tool_text = req.tool_display.lock().ok()
+                .map(|t| t.clone())
+                .unwrap_or_default();
+            let text = req.streaming_text.lock().ok()
+                .map(|t| t.clone())
+                .unwrap_or_default();
+            let thinking = if text.is_empty() {
+                String::new()
+            } else {
+                // Collapse whitespace for single-line display, take last 100 chars
+                let collapsed: String = text
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let max_chars = 100;
+                let char_count = collapsed.chars().count();
+                if char_count <= max_chars {
+                    collapsed
+                } else {
+                    let skip = char_count - max_chars;
+                    let tail: String = collapsed.chars().skip(skip).collect();
+                    format!("…{}", tail)
+                }
+            };
+            (thinking, tool_text)
+        })
+        .unwrap_or_default();
+
+    // Check if the most recent request is a search (uses label)
+    let last_label = context
+        .editor
+        .ai_requests
+        .last()
+        .map(|req| req.label.as_str())
+        .unwrap_or("AI");
+    let is_search = last_label.contains("Search");
+
+    let label = if count > 1 {
+        format!("AI[{}]", count)
+    } else {
+        "AI".to_string()
+    };
+
+    let content = if is_search {
+        // Search: show thinking and tool call independently
+        // "AI Searching: <thinking> → <tool>"
+        match (thinking_snippet.is_empty(), tool_snippet.is_empty()) {
+            (true, true) => format!(" {} AI Searching… ", FRAMES[frame_idx]),
+            (false, true) => format!(" {} AI Searching: {} ", FRAMES[frame_idx], thinking_snippet),
+            (true, false) => format!(" {} AI Searching: {} ", FRAMES[frame_idx], tool_snippet),
+            (false, false) => format!(" {} AI Searching: {} {} ", FRAMES[frame_idx], thinking_snippet, tool_snippet),
+        }
+    } else {
+        // Replace: prefer tool display, fall back to thinking
+        let snippet = if !tool_snippet.is_empty() {
+            &tool_snippet
+        } else {
+            &thinking_snippet
+        };
+        if snippet.is_empty() {
+            format!(" {} {} ", FRAMES[frame_idx], label)
+        } else {
+            format!(" {} {}: {} ", FRAMES[frame_idx], label, snippet)
+        }
+    };
+
+    write(context, Span::styled(content, style));
 }
 
 fn render_diagnostics<'a, F>(context: &mut RenderContext<'a>, write: F)
