@@ -122,7 +122,16 @@ impl Config {
             fs::read_to_string(helix_loader::config_file()).map_err(ConfigLoadError::Error);
         let local_config = fs::read_to_string(helix_loader::workspace_config_file())
             .map_err(ConfigLoadError::Error);
-        Config::load(global_config, local_config)
+        let mut config = Config::load(global_config, local_config)?;
+
+        // Overlay ai-config.toml if it exists (separate file for AI settings)
+        if let Ok(ai_toml) = fs::read_to_string(helix_loader::ai_config_file()) {
+            if let Ok(ai_cfg) = toml::from_str::<helix_view::editor::AiConfig>(&ai_toml) {
+                config.editor.ai = ai_cfg;
+            }
+        }
+
+        Ok(config)
     }
 }
 

@@ -148,6 +148,10 @@ pub fn lang_config_file() -> PathBuf {
     config_dir().join("languages.toml")
 }
 
+pub fn ai_config_file() -> PathBuf {
+    config_dir().join("ai-config.toml")
+}
+
 pub fn default_log_file() -> PathBuf {
     cache_dir().join("helix.log")
 }
