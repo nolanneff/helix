@@ -348,7 +348,7 @@ impl StreamParseState {
     }
 }
 
-/// Process a single NDJSON line from Claude's stream-json output.
+/// Dispatch a single NDJSON line to the appropriate provider-specific parser.
 ///
 /// - `streaming_buf`: thinking/text content (shown in virtual lines & statusline)
 /// - `tool_buf`: current tool call display (shown on a dedicated line)
@@ -356,6 +356,25 @@ impl StreamParseState {
 ///
 /// Returns `true` if a redraw is needed.
 fn process_stream_line(
+    line: &str,
+    state: &mut StreamParseState,
+    streaming_buf: &Arc<Mutex<String>>,
+    tool_buf: &Arc<Mutex<String>>,
+    result_buf: &Arc<Mutex<String>>,
+    provider: &AiProvider,
+) -> bool {
+    match provider {
+        AiProvider::Claude | AiProvider::Custom => {
+            process_claude_stream_line(line, state, streaming_buf, tool_buf, result_buf)
+        }
+        AiProvider::OpenCode => {
+            process_opencode_stream_line(line, state, streaming_buf, tool_buf, result_buf)
+        }
+    }
+}
+
+/// Process a single NDJSON line from Claude's stream-json output.
+fn process_claude_stream_line(
     line: &str,
     state: &mut StreamParseState,
     streaming_buf: &Arc<Mutex<String>>,
@@ -490,18 +509,176 @@ fn process_stream_line(
     false
 }
 
+/// Process a single NDJSON line from OpenCode's `--format json` output.
+///
+/// OpenCode emits one JSON object per line. Known top-level types:
+///   step_start, step_finish, text, tool_use
+///
+/// Actual field paths (from real output):
+///   - Text:     part.text
+///   - Tool:     part.tool (name), part.state.input (args), part.state.output (result)
+///   - Thinking: part.metadata.<provider>.reasoning_details[].text
+fn process_opencode_stream_line(
+    line: &str,
+    state: &mut StreamParseState,
+    streaming_buf: &Arc<Mutex<String>>,
+    tool_buf: &Arc<Mutex<String>>,
+    result_buf: &Arc<Mutex<String>>,
+) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let json = match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(j) => j,
+        Err(_) => return false,
+    };
+
+    let part = json.get("part");
+
+    match json.get("type").and_then(|t| t.as_str()) {
+        Some("text") | Some("text_delta") => {
+            if let Some(text) = part.and_then(|p| p.get("text")).and_then(|t| t.as_str()) {
+                if let Ok(mut buf) = streaming_buf.lock() {
+                    buf.push_str(text);
+                }
+                if let Ok(mut buf) = result_buf.lock() {
+                    buf.push_str(text);
+                }
+                return true;
+            }
+        }
+        Some("tool_use") | Some("tool_call") => {
+            let p = match part {
+                Some(p) => p,
+                None => return false,
+            };
+
+            // Tool name: part.tool
+            let tool_name = p
+                .get("tool")
+                .or_else(|| p.get("name"))
+                .or_else(|| p.get("toolName"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("tool");
+
+            // Tool input: part.state.input (object with tool-specific args)
+            let input_str = p
+                .pointer("/state/input")
+                .or_else(|| p.get("input"))
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+
+            // Check if this is a write to our temp file
+            let is_temp_write = (tool_name == "write" || tool_name == "Write")
+                && input_str.contains("helix-ai");
+
+            // Build display strings BEFORE locking any buffers, so we can
+            // set streaming_buf and tool_buf back-to-back without a gap
+            // (prevents the ticker from rendering a partial state).
+            let tool_display_str = if is_temp_write {
+                "Finalizing…".to_string()
+            } else {
+                format_tool_display(tool_name, &input_str)
+            };
+
+            // Extract reasoning/thinking from provider metadata if present.
+            // Path: part.metadata.<provider>.reasoning_details[].text
+            let mut reasoning_text = String::new();
+            if let Some(metadata) = p.get("metadata") {
+                if let Some(obj) = metadata.as_object() {
+                    for (_provider, details) in obj {
+                        if let Some(reasons) = details.get("reasoning_details").and_then(|r| r.as_array()) {
+                            for reason in reasons {
+                                if let Some(text) = reason.get("text").and_then(|t| t.as_str()) {
+                                    reasoning_text = text.to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Set both buffers back-to-back: reasoning first, then tool display
+            if !reasoning_text.is_empty() {
+                if let Ok(mut buf) = streaming_buf.lock() {
+                    buf.clear();
+                    buf.push_str(&reasoning_text);
+                }
+            }
+            if let Ok(mut buf) = tool_buf.lock() {
+                buf.clear();
+                buf.push_str(&tool_display_str);
+            }
+
+            state.current_tool_name = Some(tool_name.to_string());
+            state.tool_args_json.clear();
+            return true;
+        }
+        Some("tool_result") => {
+            if let Ok(mut buf) = tool_buf.lock() {
+                buf.clear();
+            }
+            state.current_tool_name = None;
+            state.tool_args_json.clear();
+            return true;
+        }
+        Some("tool_error") => {
+            let error_msg = part
+                .and_then(|p| p.get("error"))
+                .or_else(|| json.get("error"))
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown error");
+            if let Ok(mut buf) = tool_buf.lock() {
+                buf.clear();
+                buf.push_str(&format!("⚠ error: {}", error_msg));
+            }
+            return true;
+        }
+        Some("step_start") => {
+            // Clear display buffers for fresh step, keep result_buf accumulating
+            if let Ok(mut buf) = streaming_buf.lock() {
+                buf.clear();
+            }
+            if let Ok(mut buf) = tool_buf.lock() {
+                buf.clear();
+            }
+        }
+        Some("step_finish") => {
+            // No-op
+        }
+        _ => {
+            return false;
+        }
+    }
+
+    false
+}
+
 /// Spawn a tokio task that reads stdout line-by-line and processes NDJSON events.
 /// Returns the result buffer (for reading the final output) and the task handle.
 fn spawn_stdout_processor(
     stdout_handle: Option<tokio::process::ChildStdout>,
     streaming_text: Arc<Mutex<String>>,
     tool_display: Arc<Mutex<String>>,
+    provider: AiProvider,
 ) -> (Arc<Mutex<String>>, tokio::task::JoinHandle<()>) {
     let result_buf = Arc::new(Mutex::new(String::new()));
     let result_buf_clone = Arc::clone(&result_buf);
 
+    // Debug: if HELIX_AI_DEBUG is set, log raw NDJSON to that path
+    let debug_path = std::env::var("HELIX_AI_DEBUG").ok().map(PathBuf::from);
+
     let handle = tokio::spawn(async move {
         let mut state = StreamParseState::new();
+        let mut debug_file = debug_path.as_ref().and_then(|p| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .ok()
+        });
         if let Some(stdout) = stdout_handle {
             let mut reader = tokio::io::BufReader::new(stdout);
             let mut line = String::new();
@@ -510,7 +687,11 @@ fn spawn_stdout_processor(
                 match tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await {
                     Ok(0) => break,
                     Ok(_) => {
-                        if process_stream_line(&line, &mut state, &streaming_text, &tool_display, &result_buf_clone) {
+                        if let Some(ref mut f) = debug_file {
+                            use std::io::Write;
+                            let _ = writeln!(f, "{}", line.trim_end());
+                        }
+                        if process_stream_line(&line, &mut state, &streaming_text, &tool_display, &result_buf_clone, &provider) {
                             helix_event::request_redraw();
                         }
                     }
@@ -530,23 +711,35 @@ fn spawn_stdout_processor(
 /// Extract a human-readable summary from a (potentially partial) tool call.
 /// e.g. `→ Bash: find . -name '*.rs'` or `→ Read: src/main.rs`
 fn format_tool_display(tool_name: &str, partial_json: &str) -> String {
-    // Map each tool to its primary argument key
+    // Map each tool to its primary argument key.
+    // Includes both Claude (PascalCase) and OpenCode (lowercase) tool names.
     let primary_key = match tool_name {
-        "Bash" => "command",
-        "Read" => "file_path",
-        "Write" => "file_path",
-        "Edit" => "file_path",
-        "Glob" => "pattern",
-        "Grep" => "pattern",
-        "WebSearch" => "query",
-        "WebFetch" => "url",
+        "Bash" | "bash" => "command",
+        "Read" | "read" => "file_path",
+        "Write" => "file_path",       // Claude uses file_path
+        "write" => "path",            // OpenCode uses path
+        "Edit" => "file_path",        // Claude uses file_path
+        "edit" => "path",             // OpenCode uses path
+        "Glob" | "glob" => "pattern",
+        "Grep" | "grep" => "pattern",
+        "WebSearch" | "websearch" => "query",
+        "WebFetch" | "webfetch" => "url",
+        "patch" => "path",            // OpenCode-only
+        "list" => "path",             // OpenCode-only (like ls)
+        "codesearch" => "query",      // OpenCode-only — displayed as "Searching"
         _ => "",
+    };
+
+    // Display name override for cleaner statusline
+    let display_name = match tool_name {
+        "codesearch" => "Searching",
+        _ => tool_name,
     };
 
     if !primary_key.is_empty() {
         if let Some(value) = extract_json_string_value(partial_json, primary_key) {
             if !value.is_empty() {
-                if tool_name == "Write" {
+                if tool_name == "Write" || tool_name == "write" {
                     // Writing to our temp file = finalizing results
                     if value.contains("helix-ai") {
                         return "Finalizing…".to_string();
@@ -554,18 +747,18 @@ fn format_tool_display(tool_name: &str, partial_json: &str) -> String {
                     // AI is writing to a non-temp file — warn the user
                     return format!("⚠ Write: {}", value);
                 }
-                return format!("→ {}: {}", tool_name, value);
+                return format!("→ {}: {}", display_name, value);
             }
         }
     }
 
-    // For Write with no args yet, show Finalizing (most likely the temp file)
-    if tool_name == "Write" {
+    // For Write/write with no args yet, show Finalizing (most likely the temp file)
+    if tool_name == "Write" || tool_name == "write" {
         return "Finalizing…".to_string();
     }
 
-    // Fallback: just the tool name with ellipsis
-    format!("→ {}…", tool_name)
+    // Fallback: just the display name with ellipsis
+    format!("→ {}…", display_name)
 }
 
 /// Extract a string value for `key` from partial JSON like `{"command":"find .`.
@@ -614,9 +807,9 @@ fn build_cli_command(
             "opencode".to_string(),
             vec![
                 "run".to_string(),
-                "--agent".to_string(),
-                "build".to_string(),
-                "-m".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+                "--model".to_string(),
                 model.to_string(),
                 prompt.to_string(),
             ],
@@ -762,6 +955,7 @@ fn start_ai_replace_request(
     let streaming_text_clone = Arc::clone(&streaming_text);
     let tool_display_clone = Arc::clone(&tool_display);
     let stop_ticker_clone = Arc::clone(&stop_ticker);
+    let provider = ai_config.provider.clone();
 
     let future = async move {
         use std::process::Stdio;
@@ -806,7 +1000,7 @@ fn start_ai_replace_request(
 
         // Parse NDJSON stdout via the shared stream processor.
         let (stdout_collected, stdout_task) =
-            spawn_stdout_processor(stdout_handle, Arc::clone(&streaming_text_clone), Arc::clone(&tool_display_clone));
+            spawn_stdout_processor(stdout_handle, Arc::clone(&streaming_text_clone), Arc::clone(&tool_display_clone), provider);
 
         // Handle cancellation while tasks run
         let cancel_result: anyhow::Result<()> = tokio::select! {
@@ -853,6 +1047,17 @@ fn start_ai_replace_request(
         };
 
         stop_ticker_clone.store(true, Ordering::Relaxed);
+
+        // Guard: never apply an empty replacement (would delete the selection)
+        if replacement.trim().is_empty() {
+            let call: Callback = Callback::EditorCompositor(Box::new(
+                move |editor: &mut helix_view::Editor, _compositor| {
+                    editor.take_ai_request(request_id);
+                    editor.set_error("AI returned empty result — selection unchanged");
+                },
+            ));
+            return Ok(call);
+        }
 
         let call: Callback = Callback::EditorCompositor(Box::new(
             move |editor: &mut helix_view::Editor, _compositor| {
@@ -1022,6 +1227,7 @@ fn start_ai_search_request(
     let streaming_text_clone = Arc::clone(&streaming_text);
     let tool_display_clone = Arc::clone(&tool_display);
     let stop_ticker_clone = Arc::clone(&stop_ticker);
+    let provider = ai_config.provider.clone();
 
     let future = async move {
         use std::process::Stdio;
@@ -1066,7 +1272,7 @@ fn start_ai_search_request(
 
         // Parse NDJSON stdout via the shared stream processor.
         let (stdout_collected, stdout_task) =
-            spawn_stdout_processor(stdout_handle, Arc::clone(&streaming_text_clone), Arc::clone(&tool_display_clone));
+            spawn_stdout_processor(stdout_handle, Arc::clone(&streaming_text_clone), Arc::clone(&tool_display_clone), provider);
 
         // Handle cancellation while tasks run
         let cancel_result: anyhow::Result<()> = tokio::select! {

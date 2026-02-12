@@ -462,6 +462,7 @@ impl PickerStartPosition {
 #[serde(rename_all = "kebab-case")]
 pub enum AiProvider {
     Claude,
+    #[serde(rename = "opencode")]
     OpenCode,
     Custom,
 }
