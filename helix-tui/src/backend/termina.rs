@@ -411,6 +411,15 @@ impl Backend for TerminaBackend {
     fn restore(&mut self) -> io::Result<()> {
         self.disable_extensions()?;
         self.disable_mouse_capture()?;
+
+        // Drain any stale escape-sequence responses (e.g. from capability
+        // detection at startup) still sitting in the input buffer.  Without
+        // this, late-arriving terminal responses leak as visible garbage
+        // after we switch back to cooked mode.
+        while self.terminal.poll(Event::is_escape, Some(std::time::Duration::ZERO))? {
+            let _ = self.terminal.read(Event::is_escape)?;
+        }
+
         write!(
             self.terminal,
             "{}{}{}{}",
@@ -579,6 +588,10 @@ impl Drop for TerminaBackend {
         if !std::thread::panicking() {
             let _ = self.disable_extensions();
             let _ = self.disable_mouse_capture();
+            // Drain stale escape-sequence responses to prevent terminal garbage on exit.
+            while self.terminal.poll(Event::is_escape, Some(std::time::Duration::ZERO)).unwrap_or(false) {
+                let _ = self.terminal.read(Event::is_escape);
+            }
             let _ = write!(
                 self.terminal,
                 "{}{}{}{}",

@@ -38,6 +38,19 @@ fn main() {
 
     println!("cargo:rustc-env=VERSION_AND_GIT_HASH={}", version);
 
+    // Bake in HELIX_DEFAULT_RUNTIME so `cargo install` works without
+    // requiring users to manually set env vars or symlink the runtime dir.
+    if std::env::var("HELIX_DEFAULT_RUNTIME").is_err() {
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let workspace_runtime = Path::new(&manifest_dir).parent().unwrap().join("runtime");
+        if workspace_runtime.exists() {
+            println!(
+                "cargo:rustc-env=HELIX_DEFAULT_RUNTIME={}",
+                workspace_runtime.canonicalize().unwrap().display()
+            );
+        }
+    }
+
     if git_hash.is_none() {
         return;
     }

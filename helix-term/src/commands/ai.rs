@@ -961,11 +961,27 @@ fn start_ai_replace_request(
         use std::process::Stdio;
         use tokio::process::Command;
 
-        let mut child = Command::new(&program)
-            .args(&args)
+        let mut cmd = Command::new(&program);
+        cmd.args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .stdin(Stdio::null())
+            .stdin(Stdio::null());
+
+        // Detach the child from our controlling terminal so it cannot send
+        // escape-sequence queries (e.g. capability detection) whose responses
+        // would leak into our input buffer and appear as garbage on quit.
+        #[cfg(unix)]
+        {
+            unsafe {
+                cmd.pre_exec(|| {
+                    // Create a new session, which detaches from the controlling tty.
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+        }
+
+        let mut child = cmd
             .spawn()
             .map_err(|e| anyhow::anyhow!("Failed to spawn AI CLI '{}': {}", program, e))?;
 
@@ -1233,11 +1249,25 @@ fn start_ai_search_request(
         use std::process::Stdio;
         use tokio::process::Command;
 
-        let mut child = Command::new(&program)
-            .args(&args)
+        let mut cmd = Command::new(&program);
+        cmd.args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .stdin(Stdio::null())
+            .stdin(Stdio::null());
+
+        // Detach the child from our controlling terminal so it cannot send
+        // escape-sequence queries whose responses would leak as garbage on quit.
+        #[cfg(unix)]
+        {
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+        }
+
+        let mut child = cmd
             .spawn()
             .map_err(|e| anyhow::anyhow!("Failed to spawn AI CLI '{}': {}", program, e))?;
 
