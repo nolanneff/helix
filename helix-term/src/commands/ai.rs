@@ -30,7 +30,7 @@ use super::Context;
 pub fn ai_replace_selection(cx: &mut Context) {
     let config = cx.editor.config();
     if !config.ai.enable {
-        cx.editor.set_error("AI features are disabled. Set [editor.ai] enable = true");
+        cx.editor.set_error("AI features are disabled. Set enable = true under [editor.ai] in ai-config.toml");
         return;
     }
 
@@ -107,11 +107,62 @@ pub fn ai_replace_selection(cx: &mut Context) {
     cx.push_layer(Box::new(overlaid_with_size(prompt, 60, 30)));
 }
 
+/// Open the AI explain prompt (space X / :ai-explain).
+/// Captures the current selection, then shows a multi-line input popup.
+pub fn ai_explain_selection(cx: &mut Context) {
+    let config = cx.editor.config();
+    if !config.ai.enable {
+        cx.editor.set_error("AI features are disabled. Set enable = true under [editor.ai] in ai-config.toml");
+        return;
+    }
+
+    let (view, doc) = current!(cx.editor);
+    let text = doc.text().clone();
+    let selection = doc.selection(view.id).clone();
+    let primary = selection.primary();
+
+    let from = primary.from();
+    let to = primary.to();
+
+    let selected_text: String = text.slice(from..to).to_string();
+
+    if selected_text.is_empty() {
+        cx.editor.set_error("No selection for AI explain");
+        return;
+    }
+
+    let file_contents = text.to_string();
+    let file_path = doc.path().cloned();
+    let doc_id = doc.id();
+    let view_id = view.id;
+
+    let ai_config = config.ai.clone();
+
+    // Launch explain directly without a prompt UI
+    let mut ctx = compositor::Context {
+        editor: cx.editor,
+        scroll: None,
+        jobs: cx.jobs,
+    };
+    start_ai_explain_request(
+        &mut ctx,
+        ai_config,
+        doc_id,
+        view_id,
+        from,
+        to,
+        selected_text,
+        file_contents,
+        file_path,
+        String::new(),
+    );
+}
+
 /// Open the AI search prompt (:ai-search).
 pub fn ai_search(cx: &mut Context) {
     let config = cx.editor.config();
     if !config.ai.enable {
-        cx.editor.set_error("AI features are disabled. Set [editor.ai] enable = true");
+        cx.editor.set_error("AI features are disabled. Set enable = true under [editor.ai] in ai-config.toml");
         return;
     }
 
@@ -245,13 +296,20 @@ Consider the context of the selection and what you are supposed to be implementi
 </Context>
 {context_files}<Location><File>{file_path}</File><Function>{range_dup}</Function></Location>
 <FunctionText>{selected_text_dup}</FunctionText>
+<Exploration>
+Before writing replacement code, decide if you need more context.
+If the selection references types, functions, structs, traits, or modules defined in other files,
+use the Read tool to examine those files first. Check imports at the top of the file to find them.
+Only explore when the replacement genuinely depends on understanding external code.
+For simple or self-contained changes, skip exploration and write the replacement directly.
+</Exploration>
 <MustObey>
 NEVER alter any file other than TEMP_FILE.
 Never provide the requested changes as conversational output. Return only the code.
 ONLY provide requested changes by writing the change to TEMP_FILE.
 Never attempt to read TEMP_FILE. It is purely for output.
 Previous contents, which may not exist, can be written over without worry.
-After writing TEMP_FILE once you should be done. Be done and end the session.
+Once you have written TEMP_FILE, you are done. End the session.
 </MustObey>
 <TEMP_FILE>{temp_path}</TEMP_FILE>"#,
         user_instructions = user_instructions,
@@ -324,6 +382,70 @@ After writing TEMP_FILE once you should be done. Be done and end the session.
 <TEMP_FILE>{temp_path}</TEMP_FILE>"#,
         user_instructions = user_instructions,
         current_file_hint = current_file_hint,
+        context_files = context_files_content,
+        temp_path = temp_path.display(),
+    )
+}
+
+fn build_explain_prompt(
+    user_instructions: &str,
+    selected_text: &str,
+    file_contents: &str,
+    file_path: Option<&Path>,
+    temp_path: &Path,
+    context_files_content: &str,
+) -> String {
+    let file_path_str = file_path
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let user_direction = if user_instructions.trim().is_empty() {
+        "Explain this code.".to_string()
+    } else {
+        user_instructions.to_string()
+    };
+
+    format!(
+        r#"<DIRECTIONS>
+{user_direction}
+</DIRECTIONS>
+<Context>
+You are an expert code explainer. The user has selected code in their editor and wants you to explain it.
+Respond in Markdown format.
+<SELECTED_CODE>
+{selected_text}
+</SELECTED_CODE>
+<FILE_CONTAINING_SELECTION>
+File: {file_path}
+{file_contents}
+</FILE_CONTAINING_SELECTION>
+</Context>
+{context_files}<Exploration>
+Before writing, analyze the selected code step by step.
+Think through: what does this code do, what patterns does it use, are there edge cases or subtleties?
+If the code references types, functions, or modules from other files, use the Read tool to examine them first.
+Only after you understand the code should you write the explanation to TEMP_FILE.
+</Exploration>
+<Guidelines>
+- Be adaptive: brief for simple code, detailed for complex code
+- Keep your explanation under ~100 lines
+- Use Markdown formatting: headers, bullet points, code blocks where helpful
+- Cover: what the code does, how it works, and any notable patterns or edge cases
+- If the user asked a specific question, focus on answering that
+- Do NOT include the original code in your explanation unless quoting small snippets
+- Write the explanation directly to TEMP_FILE
+</Guidelines>
+<MustObey>
+NEVER alter any file other than TEMP_FILE.
+ONLY provide the explanation by writing it to TEMP_FILE.
+Never attempt to read TEMP_FILE. It is purely for output.
+Once you have written TEMP_FILE, you are done. End the session.
+</MustObey>
+<TEMP_FILE>{temp_path}</TEMP_FILE>"#,
+        user_direction = user_direction,
+        selected_text = selected_text,
+        file_contents = file_contents,
+        file_path = file_path_str,
         context_files = context_files_content,
         temp_path = temp_path.display(),
     )
@@ -781,12 +903,16 @@ fn extract_json_string_value(json: &str, key: &str) -> Option<String> {
 // CLI command construction
 // ---------------------------------------------------------------------------
 
+/// Build the CLI command for the AI provider.
+/// Returns (program, args, use_stdin) — when `use_stdin` is true the caller
+/// must pipe the prompt text into the child's stdin instead of passing it as
+/// an argument (avoids the OS `ARG_MAX` / E2BIG limit on large prompts).
 fn build_cli_command(
     provider: &AiProvider,
     model: &str,
     prompt: &str,
     custom_command: &[String],
-) -> (String, Vec<String>) {
+) -> (String, Vec<String>, bool) {
     match provider {
         AiProvider::Claude => (
             "claude".to_string(),
@@ -800,8 +926,8 @@ fn build_cli_command(
                 "--allowedTools".to_string(),
                 "Write,Edit,Read,Bash,WebSearch,WebFetch".to_string(),
                 "-p".to_string(),
-                prompt.to_string(),
             ],
+            true, // prompt piped via stdin
         ),
         AiProvider::OpenCode => (
             "opencode".to_string(),
@@ -813,10 +939,11 @@ fn build_cli_command(
                 model.to_string(),
                 prompt.to_string(),
             ],
+            false,
         ),
         AiProvider::Custom => {
             if custom_command.is_empty() {
-                return ("echo".to_string(), vec!["Error: no custom_command configured".to_string()]);
+                return ("echo".to_string(), vec!["Error: no custom_command configured".to_string()], false);
             }
             let program = custom_command[0].clone();
             let args: Vec<String> = custom_command[1..]
@@ -826,7 +953,7 @@ fn build_cli_command(
                         .replace("{prompt}", prompt)
                 })
                 .collect();
-            (program, args)
+            (program, args, false)
         }
     }
 }
@@ -865,6 +992,25 @@ pub fn start_ai_search_request_from_compositor(
     start_ai_search_request(ctx, ai_config, file_path, user_instructions);
 }
 
+/// Public entry point for typed commands to start an AI explain request.
+pub fn start_ai_explain_request_from_compositor(
+    ctx: &mut compositor::Context,
+    ai_config: helix_view::editor::AiConfig,
+    doc_id: DocumentId,
+    view_id: helix_view::ViewId,
+    from: usize,
+    to: usize,
+    selected_text: String,
+    file_contents: String,
+    file_path: Option<PathBuf>,
+    user_instructions: String,
+) {
+    start_ai_explain_request(
+        ctx, ai_config, doc_id, view_id, from, to, selected_text, file_contents,
+        file_path, user_instructions,
+    );
+}
+
 fn start_ai_replace_request(
     ctx: &mut compositor::Context,
     ai_config: helix_view::editor::AiConfig,
@@ -878,6 +1024,10 @@ fn start_ai_replace_request(
     doc_version: i32,
     user_instructions: String,
 ) {
+    if ai_config.return_to_normal {
+        ctx.editor.mode = helix_view::document::Mode::Normal;
+    }
+
     // Check max concurrent limit early, before allocating resources
     let max = ai_config.max_concurrent;
     if max > 0 && ctx.editor.ai_requests.len() >= max {
@@ -910,7 +1060,7 @@ fn start_ai_replace_request(
         &context_files_content,
     );
 
-    let (program, args) = build_cli_command(
+    let (program, args, use_stdin) = build_cli_command(
         &ai_config.provider,
         &ai_config.model,
         &prompt_text,
@@ -956,6 +1106,7 @@ fn start_ai_replace_request(
     let tool_display_clone = Arc::clone(&tool_display);
     let stop_ticker_clone = Arc::clone(&stop_ticker);
     let provider = ai_config.provider.clone();
+    let prompt_for_stdin = if use_stdin { Some(prompt_text.clone()) } else { None };
 
     let future = async move {
         use std::process::Stdio;
@@ -965,7 +1116,7 @@ fn start_ai_replace_request(
         cmd.args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .stdin(Stdio::null());
+            .stdin(if prompt_for_stdin.is_some() { Stdio::piped() } else { Stdio::null() });
 
         // Detach the child from our controlling terminal so it cannot send
         // escape-sequence queries (e.g. capability detection) whose responses
@@ -984,6 +1135,15 @@ fn start_ai_replace_request(
         let mut child = cmd
             .spawn()
             .map_err(|e| anyhow::anyhow!("Failed to spawn AI CLI '{}': {}", program, e))?;
+
+        // Pipe prompt via stdin if needed (avoids ARG_MAX limit)
+        if let Some(ref prompt_text) = prompt_for_stdin {
+            if let Some(mut stdin) = child.stdin.take() {
+                use tokio::io::AsyncWriteExt;
+                let _ = stdin.write_all(prompt_text.as_bytes()).await;
+                drop(stdin); // close stdin so the child knows input is done
+            }
+        }
 
         let stdout_handle = child.stdout.take();
         let stderr_handle = child.stderr.take();
@@ -1175,6 +1335,10 @@ fn start_ai_search_request(
     file_path: Option<PathBuf>,
     user_instructions: String,
 ) {
+    if ai_config.return_to_normal {
+        ctx.editor.mode = helix_view::document::Mode::Normal;
+    }
+
     let request_id = ctx.editor.next_ai_request_id();
 
     let context_files_content = discover_context_files(
@@ -1196,7 +1360,7 @@ fn start_ai_search_request(
     } else {
         &ai_config.search_model
     };
-    let (program, args) = build_cli_command(
+    let (program, args, use_stdin) = build_cli_command(
         &ai_config.provider,
         search_model,
         &prompt_text,
@@ -1244,6 +1408,7 @@ fn start_ai_search_request(
     let tool_display_clone = Arc::clone(&tool_display);
     let stop_ticker_clone = Arc::clone(&stop_ticker);
     let provider = ai_config.provider.clone();
+    let prompt_for_stdin = if use_stdin { Some(prompt_text.clone()) } else { None };
 
     let future = async move {
         use std::process::Stdio;
@@ -1253,7 +1418,7 @@ fn start_ai_search_request(
         cmd.args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .stdin(Stdio::null());
+            .stdin(if prompt_for_stdin.is_some() { Stdio::piped() } else { Stdio::null() });
 
         // Detach the child from our controlling terminal so it cannot send
         // escape-sequence queries whose responses would leak as garbage on quit.
@@ -1270,6 +1435,15 @@ fn start_ai_search_request(
         let mut child = cmd
             .spawn()
             .map_err(|e| anyhow::anyhow!("Failed to spawn AI CLI '{}': {}", program, e))?;
+
+        // Pipe prompt via stdin if needed (avoids ARG_MAX limit)
+        if let Some(ref prompt_text) = prompt_for_stdin {
+            if let Some(mut stdin) = child.stdin.take() {
+                use tokio::io::AsyncWriteExt;
+                let _ = stdin.write_all(prompt_text.as_bytes()).await;
+                drop(stdin);
+            }
+        }
 
         let stdout_handle = child.stdout.take();
         let stderr_handle = child.stderr.take();
@@ -1359,6 +1533,265 @@ fn start_ai_search_request(
     };
 
     ctx.jobs.callback(future);
+}
+
+fn start_ai_explain_request(
+    ctx: &mut compositor::Context,
+    ai_config: helix_view::editor::AiConfig,
+    doc_id: DocumentId,
+    _view_id: helix_view::ViewId,
+    from: usize,
+    to: usize,
+    selected_text: String,
+    file_contents: String,
+    file_path: Option<PathBuf>,
+    user_instructions: String,
+) {
+    if ai_config.return_to_normal {
+        ctx.editor.mode = helix_view::document::Mode::Normal;
+    }
+
+    // Check max concurrent limit early, before allocating resources
+    let max = ai_config.max_concurrent;
+    if max > 0 && ctx.editor.ai_requests.len() >= max {
+        ctx.editor.set_error(format!(
+            "Maximum concurrent AI requests ({}) reached. Cancel one first.",
+            max
+        ));
+        return;
+    }
+
+    let request_id = ctx.editor.next_ai_request_id();
+
+    let context_files_content = discover_context_files(
+        file_path.as_deref(),
+        &ai_config.context_files,
+    );
+
+    let temp_path = std::env::temp_dir().join(format!("helix-ai-explain-{}", request_id));
+
+    let prompt_text = build_explain_prompt(
+        &user_instructions,
+        &selected_text,
+        &file_contents,
+        file_path.as_deref(),
+        &temp_path,
+        &context_files_content,
+    );
+
+    let (program, args, use_stdin) = build_cli_command(
+        &ai_config.provider,
+        &ai_config.model,
+        &prompt_text,
+        &ai_config.custom_command,
+    );
+
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let streaming_text = Arc::new(Mutex::new(String::new()));
+    let tool_display = Arc::new(Mutex::new(String::new()));
+    let stop_ticker = Arc::new(AtomicBool::new(false));
+    ctx.editor.ai_requests.push(helix_view::ai::AiRequestState {
+        id: request_id,
+        label: "AI Analyzer".to_string(),
+        doc_id,
+        original_from: from,
+        original_to: to,
+        original_text: String::new(),
+        doc_version: 0,
+        cancel_tx,
+        streaming_text: Arc::clone(&streaming_text),
+        tool_display: Arc::clone(&tool_display),
+        started_at: tokio::time::Instant::now(),
+        stop_ticker: Arc::clone(&stop_ticker),
+    });
+
+    let query_preview: String = if user_instructions.is_empty() {
+        "Explain selection".to_string()
+    } else {
+        user_instructions.chars().take(80).collect()
+    };
+    ctx.editor.set_status(format!("Explain: \"{}\"", query_preview));
+
+    // Spawn a spinner ticker that redraws every 80ms
+    let ticker_stop = Arc::clone(&stop_ticker);
+    tokio::spawn(async move {
+        while !ticker_stop.load(Ordering::Relaxed) {
+            tokio::time::sleep(tokio::time::Duration::from_millis(80)).await;
+            if ticker_stop.load(Ordering::Relaxed) {
+                break;
+            }
+            helix_event::request_redraw();
+        }
+    });
+
+    let temp_path_clone = temp_path.clone();
+    let streaming_text_clone = Arc::clone(&streaming_text);
+    let tool_display_clone = Arc::clone(&tool_display);
+    let stop_ticker_clone = Arc::clone(&stop_ticker);
+    let provider = ai_config.provider.clone();
+    let prompt_for_stdin = if use_stdin { Some(prompt_text.clone()) } else { None };
+
+    let future = async move {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        let mut cmd = Command::new(&program);
+        cmd.args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(if prompt_for_stdin.is_some() { Stdio::piped() } else { Stdio::null() });
+
+        // Detach the child from our controlling terminal so it cannot send
+        // escape-sequence queries whose responses would leak as garbage on quit.
+        #[cfg(unix)]
+        {
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+        }
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("Failed to spawn AI CLI '{}': {}", program, e))?;
+
+        // Pipe prompt via stdin if needed (avoids ARG_MAX limit)
+        if let Some(ref prompt_text) = prompt_for_stdin {
+            if let Some(mut stdin) = child.stdin.take() {
+                use tokio::io::AsyncWriteExt;
+                let _ = stdin.write_all(prompt_text.as_bytes()).await;
+                drop(stdin);
+            }
+        }
+
+        let stdout_handle = child.stdout.take();
+        let stderr_handle = child.stderr.take();
+
+        // Collect stderr for error reporting
+        let stderr_collected = Arc::new(Mutex::new(String::new()));
+        let stderr_collected_clone = Arc::clone(&stderr_collected);
+        let stderr_task = tokio::spawn(async move {
+            if let Some(stderr) = stderr_handle {
+                let mut reader = tokio::io::BufReader::new(stderr);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let trimmed = line.trim_end().to_string();
+                            if let Ok(mut collected) = stderr_collected_clone.lock() {
+                                if !collected.is_empty() {
+                                    collected.push('\n');
+                                }
+                                collected.push_str(&trimmed);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        });
+
+        // Parse NDJSON stdout via the shared stream processor.
+        let (stdout_collected, stdout_task) =
+            spawn_stdout_processor(stdout_handle, Arc::clone(&streaming_text_clone), Arc::clone(&tool_display_clone), provider);
+
+        // Handle cancellation while tasks run
+        let cancel_result: anyhow::Result<()> = tokio::select! {
+            _ = async {
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+            } => { Ok(()) }
+            _ = cancel_rx => {
+                let _ = child.kill().await;
+                let _ = std::fs::remove_file(&temp_path_clone);
+                stop_ticker_clone.store(true, Ordering::Relaxed);
+                anyhow::bail!("AI explain cancelled")
+            }
+        };
+
+        if let Err(e) = cancel_result {
+            return Err(e);
+        }
+
+        let status = child.wait().await?;
+
+        let stderr_str = stderr_collected.lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+
+        if !status.success() {
+            stop_ticker_clone.store(true, Ordering::Relaxed);
+            anyhow::bail!("AI explain failed: {}", stderr_str);
+        }
+
+        let stdout_str = stdout_collected.lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+
+        // Try reading from temp file first, fall back to collected stdout
+        let explanation = if temp_path_clone.exists() {
+            let content = std::fs::read_to_string(&temp_path_clone)
+                .unwrap_or_else(|_| stdout_str.clone());
+            let _ = std::fs::remove_file(&temp_path_clone);
+            content
+        } else {
+            stdout_str
+        };
+
+        stop_ticker_clone.store(true, Ordering::Relaxed);
+
+        if explanation.trim().is_empty() {
+            let call: Callback = Callback::EditorCompositor(Box::new(
+                move |editor: &mut helix_view::Editor, _compositor| {
+                    editor.take_ai_request(request_id);
+                    editor.set_error("AI returned empty explanation");
+                },
+            ));
+            return Ok(call);
+        }
+
+        let call: Callback = Callback::EditorCompositor(Box::new(
+            move |editor: &mut helix_view::Editor, _compositor| {
+                editor.take_ai_request(request_id);
+                show_explain_result(editor, &explanation);
+            },
+        ));
+        Ok(call)
+    };
+
+    ctx.jobs.callback(future);
+}
+
+fn show_explain_result(
+    editor: &mut helix_view::Editor,
+    explanation: &str,
+) {
+    let rope = helix_core::Rope::from(explanation);
+    let doc = helix_view::Document::from(
+        rope,
+        None,
+        editor.config.clone(),
+        editor.syn_loader.clone(),
+    );
+    let doc_id = editor.new_file_from_document(
+        helix_view::editor::Action::VerticalSplit,
+        doc,
+    );
+
+    // Set markdown syntax highlighting and mark as unmodified scratch buffer
+    let loader = editor.syn_loader.load();
+    let doc = doc_mut!(editor, &doc_id);
+    if let Err(e) = doc.set_language_by_language_id("markdown", &loader) {
+        log::warn!("Failed to set markdown language for AI explain buffer: {}", e);
+    }
+    doc.reset_modified();
+
+    editor.set_status("AI explanation ready");
 }
 
 /// Parse search results, store them on the editor, jump to the first, and show a summary.

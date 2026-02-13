@@ -10,10 +10,10 @@ use helix_core::Position;
 /// `below_line` is the last doc line of the selection — virtual lines inserted
 /// after this line appear visually below the selection.
 ///
-/// The number of lines above the selection is dynamic:
-/// - 1 line (spinner only) when thinking_lines == 0
-/// - 2 lines (spinner + 1 thinking) when thinking_lines == 1
-/// - 3 lines (spinner + 2 thinking) when thinking_lines == 2
+/// Spinners always appear on both sides (above and below the selection).
+/// When `show_below` is true, thinking text + tool calls are placed below the
+/// selection instead of above. This is used for large selections when the
+/// selection start is near the top of the viewport.
 pub struct AiProgressAnnotation {
     above_line: usize,
     below_line: usize,
@@ -24,6 +24,8 @@ pub struct AiProgressAnnotation {
     thinking_lines: u8,
     /// Whether a tool call display line is active
     has_tool_line: bool,
+    /// If true, thinking + tool lines go below the selection instead of above
+    show_below: bool,
 }
 
 impl AiProgressAnnotation {
@@ -34,19 +36,22 @@ impl AiProgressAnnotation {
         below_char: usize,
         thinking_lines: u8,
         has_tool_line: bool,
+        show_below: bool,
     ) -> Box<dyn LineAnnotation> {
         Box::new(Self {
             above_line,
             below_line,
             above_char,
             below_char,
-            next_anchor: Cell::new(above_char),
+            next_anchor: Cell::new(above_char.min(below_char)),
             thinking_lines,
             has_tool_line,
+            show_below,
         })
     }
 
     fn compute_next_anchor(&self, after: usize) -> usize {
+        // Always anchor both lines — spinners appear on both sides
         if after <= self.above_char {
             self.above_char
         } else if after <= self.below_char && self.below_line != self.above_line {
@@ -91,12 +96,17 @@ impl LineAnnotation for AiProgressAnnotation {
         _line_end_visual_pos: Position,
         doc_line: usize,
     ) -> Position {
+        let detail_lines = self.thinking_lines as usize
+            + if self.has_tool_line { 1 } else { 0 };
+
         if doc_line == self.above_line {
-            // 1 (spinner) + thinking_lines (0..2) + tool_line (0 or 1)
-            let tool_extra = if self.has_tool_line { 1 } else { 0 };
-            Position::new(1 + self.thinking_lines as usize + tool_extra, 0)
+            // Spinner always above; thinking+tool here when !show_below
+            let extra = if self.show_below { 0 } else { detail_lines };
+            Position::new(1 + extra, 0)
         } else if doc_line == self.below_line && self.below_line != self.above_line {
-            Position::new(1, 0)
+            // Spinner always below; thinking+tool here when show_below
+            let extra = if self.show_below { detail_lines } else { 0 };
+            Position::new(1 + extra, 0)
         } else {
             Position::new(0, 0)
         }

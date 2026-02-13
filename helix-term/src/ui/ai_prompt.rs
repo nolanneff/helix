@@ -204,9 +204,6 @@ impl Component for AiPrompt {
                     if let Some(cb) = on_submit {
                         cb(ctx, text);
                     }
-                    if ctx.editor.config().ai.return_to_normal {
-                        ctx.editor.mode = helix_view::document::Mode::Normal;
-                    }
                     compositor.pop();
                 })))
             }

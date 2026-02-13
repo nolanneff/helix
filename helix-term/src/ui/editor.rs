@@ -92,8 +92,13 @@ impl EditorView {
         let view_offset = doc.view_offset(view.id);
 
         // Compute AI progress info for all active requests targeting this document.
-        // Each entry: (above_line, below_line, above_char, below_char, thinking_lines, has_tool_line, req_index)
-        let ai_progress_infos: Vec<(usize, usize, usize, usize, u8, bool, usize)> = editor
+        // Each entry: (above_line, below_line, above_char, below_char, thinking_lines, has_tool_line, show_below, req_index)
+        let flip_threshold = config.ai.progress_flip_threshold;
+        let viewport_height = inner.height as usize;
+        let anchor_line = doc.text().slice(..).char_to_line(
+            view_offset.anchor.min(doc.text().len_chars()),
+        );
+        let ai_progress_infos: Vec<(usize, usize, usize, usize, u8, bool, bool, usize)> = editor
             .ai_requests
             .iter()
             .enumerate()
@@ -143,13 +148,21 @@ impl EditorView {
                     .map(|g| !g.is_empty())
                     .unwrap_or(false);
 
-                Some((above_line, below_line, above_char, below_char, thinking_lines, has_tool_line, idx))
+                // Determine whether to show progress below the selection.
+                // Only flip if: threshold is set, selection exceeds it, and
+                // selection start is in the top half of the viewport.
+                let selection_lines = end_line.saturating_sub(start_line) + 1;
+                let show_below = flip_threshold > 0
+                    && selection_lines >= flip_threshold
+                    && start_line.saturating_sub(anchor_line) < viewport_height / 2;
+
+                Some((above_line, below_line, above_char, below_char, thinking_lines, has_tool_line, show_below, idx))
             })
             .collect();
 
-        let annotation_tuples: Vec<(usize, usize, usize, usize, u8, bool)> = ai_progress_infos
+        let annotation_tuples: Vec<(usize, usize, usize, usize, u8, bool, bool)> = ai_progress_infos
             .iter()
-            .map(|&(a, b, c, d, e, f, _)| (a, b, c, d, e, f))
+            .map(|&(a, b, c, d, e, f, g, _)| (a, b, c, d, e, f, g))
             .collect();
         let text_annotations = view.text_annotations_with_ai(doc, Some(theme), &annotation_tuples);
         let mut decorations = DecorationManager::default();
@@ -256,7 +269,7 @@ impl EditorView {
             inline_diagnostic_config,
             config.end_of_line_diagnostics,
         ));
-        for &(above_line, below_line, _, _, thinking_lines, has_tool_line, req_idx) in &ai_progress_infos {
+        for &(above_line, below_line, _, _, thinking_lines, has_tool_line, show_below, req_idx) in &ai_progress_infos {
             let req = &editor.ai_requests[req_idx];
             use helix_view::graphics::Modifier;
             let base = theme.get("comment");
@@ -278,6 +291,12 @@ impl EditorView {
                     below_line,
                     thinking_lines,
                     has_tool_line,
+                    show_below,
+                    label: match req.label.as_str() {
+                        "AI Analyzer" => "Analyzing".to_string(),
+                        "AI Searching" => "Searching".to_string(),
+                        _ => "Implementing".to_string(),
+                    },
                     style: thinking_style,
                     spinner_style,
                     tool_style,

@@ -453,7 +453,7 @@ impl View {
         &self,
         doc: &'a Document,
         theme: Option<&Theme>,
-        ai_progress_list: &[(usize, usize, usize, usize, u8, bool)],
+        ai_progress_list: &[(usize, usize, usize, usize, u8, bool, bool)],
     ) -> TextAnnotations<'a> {
         let mut text_annotations = TextAnnotations::default();
 
@@ -523,10 +523,10 @@ impl View {
             ));
         }
 
-        for &(start_line, end_line, start_char, end_char, thinking_lines, has_tool_line) in ai_progress_list {
+        for &(start_line, end_line, start_char, end_char, thinking_lines, has_tool_line, show_below) in ai_progress_list {
             text_annotations.add_line_annotation(
                 crate::annotations::ai_progress::AiProgressAnnotation::new(
-                    start_line, end_line, start_char, end_char, thinking_lines, has_tool_line,
+                    start_line, end_line, start_char, end_char, thinking_lines, has_tool_line, show_below,
                 ),
             );
         }

@@ -2748,7 +2748,7 @@ fn noop(_cx: &mut compositor::Context, _args: Args, _event: PromptEvent) -> anyh
 
 fn ai_replace(
     cx: &mut compositor::Context,
-    _args: Args,
+    args: Args,
     event: PromptEvent,
 ) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
@@ -2757,7 +2757,7 @@ fn ai_replace(
 
     let config = cx.editor.config();
     if !config.ai.enable {
-        anyhow::bail!("AI features are disabled. Set [editor.ai] enable = true");
+        anyhow::bail!("AI features are disabled. Set enable = true under [editor.ai] in ai-config.toml");
     }
 
     let (view, doc) = current!(cx.editor);
@@ -2779,34 +2779,53 @@ fn ai_replace(
     let view_id = view.id;
     let ai_config = config.ai.clone();
 
-    let prompt = crate::ui::ai_prompt::AiPrompt::new(
-        "AI Replace".to_string(),
-        move |ctx: &mut compositor::Context, user_instructions: String| {
-            super::ai::start_ai_replace_request_from_compositor(
-                ctx,
-                ai_config,
-                doc_id,
-                view_id,
-                from,
-                to,
-                selected_text,
-                file_contents,
-                file_path,
-                doc_version,
-                user_instructions,
-            );
-        },
-    );
+    let user_instructions = args.join(" ");
+    if !user_instructions.is_empty() {
+        // Launch directly with inline args
+        super::ai::start_ai_replace_request_from_compositor(
+            cx,
+            ai_config,
+            doc_id,
+            view_id,
+            from,
+            to,
+            selected_text,
+            file_contents,
+            file_path,
+            doc_version,
+            user_instructions,
+        );
+    } else {
+        // No args — open prompt UI
+        let prompt = crate::ui::ai_prompt::AiPrompt::new(
+            "AI Replace".to_string(),
+            move |ctx: &mut compositor::Context, user_instructions: String| {
+                super::ai::start_ai_replace_request_from_compositor(
+                    ctx,
+                    ai_config,
+                    doc_id,
+                    view_id,
+                    from,
+                    to,
+                    selected_text,
+                    file_contents,
+                    file_path,
+                    doc_version,
+                    user_instructions,
+                );
+            },
+        );
 
-    cx.editor.set_status("Opening AI prompt...");
-    let callback = async move {
-        let call: crate::job::Callback =
-            crate::job::Callback::EditorCompositor(Box::new(move |_editor, compositor| {
-                compositor.push(Box::new(crate::ui::overlay::overlaid(prompt)));
-            }));
-        Ok(call)
-    };
-    cx.jobs.callback(callback);
+        cx.editor.set_status("Opening AI prompt...");
+        let callback = async move {
+            let call: crate::job::Callback =
+                crate::job::Callback::EditorCompositor(Box::new(move |_editor, compositor| {
+                    compositor.push(Box::new(crate::ui::overlay::overlaid(prompt)));
+                }));
+            Ok(call)
+        };
+        cx.jobs.callback(callback);
+    }
 
     Ok(())
 }
@@ -2874,7 +2893,7 @@ fn ai_cancel_all_cmd(
 
 fn ai_search_cmd(
     cx: &mut compositor::Context,
-    _args: Args,
+    args: Args,
     event: PromptEvent,
 ) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
@@ -2883,33 +2902,125 @@ fn ai_search_cmd(
 
     let config = cx.editor.config();
     if !config.ai.enable {
-        anyhow::bail!("AI features are disabled. Set [editor.ai] enable = true");
+        anyhow::bail!("AI features are disabled. Set enable = true under [editor.ai] in ai-config.toml");
     }
 
     let (_view, doc) = current!(cx.editor);
     let file_path = doc.path().cloned();
     let ai_config = config.ai.clone();
 
-    let prompt = crate::ui::ai_prompt::AiPrompt::new(
-        "AI Search".to_string(),
-        move |ctx: &mut compositor::Context, user_instructions: String| {
-            super::ai::start_ai_search_request_from_compositor(
-                ctx,
-                ai_config,
-                file_path,
-                user_instructions,
-            );
-        },
-    );
+    let user_instructions = args.join(" ");
+    if !user_instructions.is_empty() {
+        // Launch directly with inline args
+        super::ai::start_ai_search_request_from_compositor(
+            cx,
+            ai_config,
+            file_path,
+            user_instructions,
+        );
+    } else {
+        // No args — open prompt UI
+        let prompt = crate::ui::ai_prompt::AiPrompt::new(
+            "AI Search".to_string(),
+            move |ctx: &mut compositor::Context, user_instructions: String| {
+                super::ai::start_ai_search_request_from_compositor(
+                    ctx,
+                    ai_config,
+                    file_path,
+                    user_instructions,
+                );
+            },
+        );
 
-    let callback = async move {
-        let call: crate::job::Callback =
-            crate::job::Callback::EditorCompositor(Box::new(move |_editor, compositor| {
-                compositor.push(Box::new(crate::ui::overlay::overlaid(prompt)));
-            }));
-        Ok(call)
-    };
-    cx.jobs.callback(callback);
+        let callback = async move {
+            let call: crate::job::Callback =
+                crate::job::Callback::EditorCompositor(Box::new(move |_editor, compositor| {
+                    compositor.push(Box::new(crate::ui::overlay::overlaid(prompt)));
+                }));
+            Ok(call)
+        };
+        cx.jobs.callback(callback);
+    }
+
+    Ok(())
+}
+
+fn ai_explain(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let config = cx.editor.config();
+    if !config.ai.enable {
+        anyhow::bail!("AI features are disabled. Set enable = true under [editor.ai] in ai-config.toml");
+    }
+
+    let (view, doc) = current!(cx.editor);
+    let text = doc.text().clone();
+    let selection = doc.selection(view.id).clone();
+    let primary = selection.primary();
+    let from = primary.from();
+    let to = primary.to();
+    let selected_text: String = primary.fragment(text.slice(..)).into_owned();
+
+    if selected_text.is_empty() {
+        anyhow::bail!("No selection for AI explain");
+    }
+
+    let file_contents = text.to_string();
+    let file_path = doc.path().cloned();
+    let doc_id = doc.id();
+    let view_id = view.id;
+    let ai_config = config.ai.clone();
+    let user_instructions = args.join(" ");
+
+    if !user_instructions.is_empty() {
+        // Launch directly with inline args
+        super::ai::start_ai_explain_request_from_compositor(
+            cx,
+            ai_config,
+            doc_id,
+            view_id,
+            from,
+            to,
+            selected_text,
+            file_contents,
+            file_path,
+            user_instructions,
+        );
+    } else {
+        // No args — open prompt UI for optional question
+        let prompt = crate::ui::ai_prompt::AiPrompt::new(
+            "AI Explain".to_string(),
+            move |ctx: &mut compositor::Context, user_instructions: String| {
+                super::ai::start_ai_explain_request_from_compositor(
+                    ctx,
+                    ai_config,
+                    doc_id,
+                    view_id,
+                    from,
+                    to,
+                    selected_text,
+                    file_contents,
+                    file_path,
+                    user_instructions,
+                );
+            },
+        );
+
+        let callback = async move {
+            let call: crate::job::Callback =
+                crate::job::Callback::EditorCompositor(Box::new(move |_editor, compositor| {
+                    compositor.push(Box::new(crate::ui::overlay::overlaid(prompt)));
+                }));
+            Ok(call)
+        };
+        cx.jobs.callback(callback);
+    }
 
     Ok(())
 }
@@ -4028,6 +4139,14 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         aliases: &[],
         doc: "Open AI semantic search prompt.",
         fun: ai_search_cmd,
+        completer: CommandCompleter::none(),
+        signature: Signature::DEFAULT,
+    },
+    TypableCommand {
+        name: "ai-explain",
+        aliases: &["aie"],
+        doc: "Explain selected code using AI in a split pane.",
+        fun: ai_explain,
         completer: CommandCompleter::none(),
         signature: Signature::DEFAULT,
     },

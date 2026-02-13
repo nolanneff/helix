@@ -492,6 +492,24 @@ pub struct AiConfig {
     pub max_concurrent: usize,
     /// Model to use for AI search (defaults to "haiku" for speed)
     pub search_model: String,
+    /// Selection line count threshold for flipping progress display below.
+    /// When a selection exceeds this many lines AND is near the top of the viewport,
+    /// the progress virtual lines are shown below the selection instead of above.
+    /// Set to 0 to disable (always show above). Default: 40.
+    pub progress_flip_threshold: usize,
+}
+
+/// Wrapper for ai-config.toml deserialization with `[editor.ai]` nesting
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct AiConfigFile {
+    pub editor: AiConfigFileEditor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct AiConfigFileEditor {
+    pub ai: AiConfig,
 }
 
 impl Default for AiConfig {
@@ -507,6 +525,7 @@ impl Default for AiConfig {
             return_to_normal: true,
             max_concurrent: 5,
             search_model: String::new(),
+            progress_flip_threshold: 40,
         }
     }
 }
@@ -1959,7 +1978,7 @@ impl Editor {
         id
     }
 
-    fn new_file_from_document(&mut self, action: Action, doc: Document) -> DocumentId {
+    pub fn new_file_from_document(&mut self, action: Action, doc: Document) -> DocumentId {
         let id = self.new_document(doc);
         self.switch(id, action);
         id

@@ -126,8 +126,8 @@ impl Config {
 
         // Overlay ai-config.toml if it exists (separate file for AI settings)
         if let Ok(ai_toml) = fs::read_to_string(helix_loader::ai_config_file()) {
-            if let Ok(ai_cfg) = toml::from_str::<helix_view::editor::AiConfig>(&ai_toml) {
-                config.editor.ai = ai_cfg;
+            if let Ok(ai_file) = toml::from_str::<helix_view::editor::AiConfigFile>(&ai_toml) {
+                config.editor.ai = ai_file.editor.ai;
             }
         }
 

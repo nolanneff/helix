@@ -605,6 +605,7 @@ impl MappableCommand {
         shell_append_output, "Append shell command output after selections",
         shell_keep_pipe, "Filter selections with shell predicate",
         ai_replace_selection, "Replace selection using AI",
+        ai_explain_selection, "Explain selection using AI",
         ai_search, "Search codebase using AI",
         ai_cancel, "Cancel active AI request",
         ai_show_results, "Browse AI search results",
@@ -6328,6 +6329,10 @@ fn shell_keep_pipe(cx: &mut Context) {
 
 fn ai_replace_selection(cx: &mut Context) {
     ai::ai_replace_selection(cx);
+}
+
+fn ai_explain_selection(cx: &mut Context) {
+    ai::ai_explain_selection(cx);
 }
 
 fn ai_search(cx: &mut Context) {

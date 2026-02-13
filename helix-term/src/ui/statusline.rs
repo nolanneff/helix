@@ -263,42 +263,24 @@ where
         })
         .unwrap_or_default();
 
-    // Check if the most recent request is a search (uses label)
     let last_label = context
         .editor
         .ai_requests
         .last()
         .map(|req| req.label.as_str())
         .unwrap_or("AI");
-    let is_search = last_label.contains("Search");
 
     let label = if count > 1 {
-        format!("AI[{}]", count)
+        format!("{}[{}]", last_label, count)
     } else {
-        "AI".to_string()
+        last_label.to_string()
     };
 
-    let content = if is_search {
-        // Search: show thinking and tool call independently
-        // "AI Searching: <thinking> → <tool>"
-        match (thinking_snippet.is_empty(), tool_snippet.is_empty()) {
-            (true, true) => format!(" {} AI Searching… ", FRAMES[frame_idx]),
-            (false, true) => format!(" {} AI Searching: {} ", FRAMES[frame_idx], thinking_snippet),
-            (true, false) => format!(" {} AI Searching: {} ", FRAMES[frame_idx], tool_snippet),
-            (false, false) => format!(" {} AI Searching: {} {} ", FRAMES[frame_idx], thinking_snippet, tool_snippet),
-        }
-    } else {
-        // Replace: prefer tool display, fall back to thinking
-        let snippet = if !tool_snippet.is_empty() {
-            &tool_snippet
-        } else {
-            &thinking_snippet
-        };
-        if snippet.is_empty() {
-            format!(" {} {} ", FRAMES[frame_idx], label)
-        } else {
-            format!(" {} {}: {} ", FRAMES[frame_idx], label, snippet)
-        }
+    let content = match (thinking_snippet.is_empty(), tool_snippet.is_empty()) {
+        (true, true) => format!(" {} {}… ", FRAMES[frame_idx], label),
+        (false, true) => format!(" {} {}: {} ", FRAMES[frame_idx], label, thinking_snippet),
+        (true, false) => format!(" {} {}: {} ", FRAMES[frame_idx], label, tool_snippet),
+        (false, false) => format!(" {} {}: {} {} ", FRAMES[frame_idx], label, thinking_snippet, tool_snippet),
     };
 
     write(context, Span::styled(content, style));
